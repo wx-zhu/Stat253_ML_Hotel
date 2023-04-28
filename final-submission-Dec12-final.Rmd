@@ -1,0 +1,686 @@
+---
+title: "Predicting Hotel Reviewers' Score And Clustering European Hotels"
+author: "Jiaying Wu, Izzy Valdivia, Wenxuan Zhu"
+date: "2021 December"
+output: html_document
+---
+
+```{r setup}
+knitr::opts_chunk$set(echo=TRUE, eval=TRUE, message=FALSE, warning = FALSE)
+```
+
+### Load package
+```{r}
+# library statements 
+# read in data
+library(dplyr)
+library(readr)
+library(broom)
+library(ggplot2)
+library(tidymodels) 
+library(stringr)
+library(tidyverse)
+library(gplots)
+library(lubridate)
+library(countrycode)
+library(gapminder)
+library(purrr)
+library(stringr)
+library(vip)
+library(probably)
+library(plotly)
+
+tidymodels_prefer() # Resolves conflicts, prefers tidymodel functions
+set.seed(189) 
+```
+
+# Clean data 
+### (DON'T RUN THIS CHUNK. WE'VE INCLUDED THE CLEAN DATA IN DATA.CSV)
+```{r eval=FALSE}
+Hotel_Reviews <- read_csv("Hotel_Reviews.csv")
+
+Hotel_Reviews_Cleaned <- Hotel_Reviews %>% na_if("") %>% na.omit
+Hotel_Reviews_Cleaned <- Hotel_Reviews_Cleaned %>% mutate(Hotel_Country = word(Hotel_Address,-1))
+
+Hotel_Reviews_Cleaned$Hotel_Country[Hotel_Reviews_Cleaned$Hotel_Country == "Kingdom"] <- "United Kingdom"
+unique(Hotel_Reviews_Cleaned$Hotel_Country)
+
+Hotels_Cleaned <-Hotel_Reviews_Cleaned %>%
+   mutate(Reviewer_continent = countrycode(sourcevar = Hotel_Reviews_Cleaned$Reviewer_Nationality,
+                             origin = "country.name",
+                             destination = "continent"))
+ 
+Hotels_Cleaned <-Hotels_Cleaned  %>%
+   separate(Review_Date, c("month", "day", "year"), sep = "/")
+ 
+Hotels_Cleaned <- Hotels_Cleaned %>% mutate(Month = month.name[as.numeric(month)])
+ 
+Hotels_Cleaned <- Hotels_Cleaned %>% 
+  mutate(season = ifelse(month %in% 10:12, "Fall",
+                                ifelse(month %in% 1:3, "Winter",
+                                       ifelse(month %in% 4:6, "Spring",
+                                              "Summer"))))
+
+Hotels_Cleaned <- Hotels_Cleaned[, -which(names(Hotels_Cleaned) == "Negative_Review")]
+Hotels_Cleaned <- Hotels_Cleaned[, -which(names(Hotels_Cleaned) == "Positive_Review")]
+Hotels_Cleaned <- Hotels_Cleaned[, -which(names(Hotels_Cleaned) == "days_since_review")]
+
+write.csv(cleanData,".../data.csv", row.names = FALSE)
+```
+
+```{r}
+Hotel_Reviews <- read_csv("data.csv")
+```
+
+```{r}
+# Delete unnecessary colunmns
+Hotel_Reviews$Reviewer_Average_Difference <- Hotel_Reviews$Reviewer_Score - Hotel_Reviews$Average_Score 
+
+Hotel_Reviews <- Hotel_Reviews[, -which(names(Hotel_Reviews) == "Hotel_Address")]
+Hotel_Reviews <- Hotel_Reviews[, -which(names(Hotel_Reviews) == "Hotel_Name")]
+Hotel_Reviews <- Hotel_Reviews[, -which(names(Hotel_Reviews) == "Tags")]
+```
+
+# Regression Model
+
+### LASSO 
+```{r, cache = TRUE}
+# Creation of CV folds
+data_cv10 <- vfold_cv(Hotel_Reviews,v = 10)
+
+# Lasso Model Spec with tune
+lm_lasso_spec_tune <- 
+  linear_reg() %>%
+  set_args(mixture = 1, penalty = tune()) %>% 
+  set_engine(engine = 'glmnet') %>% 
+  set_mode('regression')  
+
+# Recipes
+full_rec <- recipe(Reviewer_Average_Difference ~., data = Hotel_Reviews) %>% 
+    step_rm(month)%>%
+    step_nzv(all_predictors()) %>% # removes variables with the same value
+    step_unknown(all_nominal_predictors()) %>% 
+    step_normalize(all_numeric_predictors()) %>% # important standardization step for LASSO
+    step_corr(all_numeric())%>%
+    step_dummy(all_nominal_predictors())  # creates indicator variables for categorical variables
+
+# Workflows
+lasso_wf_tune <- workflow() %>% 
+  add_recipe(full_rec) %>%
+  add_model(lm_lasso_spec_tune) 
+
+# Tune Model (trying a variety of values of Lambda penalty)
+penalty_grid <- grid_regular(
+  penalty(range = c(-4, 1)), 
+  levels = 30)
+
+tune_output <- tune_grid( 
+  lasso_wf_tune, 
+  resamples = data_cv10, 
+  metrics = metric_set(rmse, mae),
+  grid = penalty_grid 
+)
+
+autoplot(tune_output) + theme_classic()
+```
+
+
+```{r}
+# Summarize Model Evaluation Metrics (CV)
+collect_metrics(tune_output)
+
+# Choose largest penalty value within 1 se
+best_se_penalty <- select_by_one_std_err(tune_output, metric = 'mae', desc(penalty)) 
+best_se_penalty 
+```
+
+```{r}
+# Fit Final Model based on our full 500k dataset 
+final_wf_se <- finalize_workflow(lasso_wf_tune, best_se_penalty) # incorporates penalty value to workflow
+final_fit_se <- fit(final_wf_se, data = Hotel_Reviews)
+
+# Look at each variables' importance
+tidy(final_fit_se) %>%
+  filter(estimate != 0.0000000) %>%
+  mutate(importance = abs(estimate)) %>%
+  arrange(desc(importance))
+
+```
+
+```{r}
+# Evaluating
+final_fit_se %>% tidy() %>% filter(estimate != 0)
+
+tune_output %>% collect_metrics() %>% filter(penalty == (best_se_penalty %>% pull(penalty)))
+
+# Visual residuals
+lasso_mod_output <- final_fit_se %>%
+    predict(new_data = Hotel_Reviews) %>%
+    bind_cols(Hotel_Reviews) %>%
+    mutate(resid = Reviewer_Average_Difference - .pred)
+
+ggplot(lasso_mod_output, aes(x = .pred, y = resid)) +
+    geom_point() +
+    geom_smooth() +
+    geom_hline(yintercept = 0, color = "red") + 
+    theme_classic()
+```
+
+
+```{r}
+glmnet_output <- final_fit_se %>% extract_fit_parsnip() %>% pluck('fit') # get the original glmnet output
+
+lambdas <- glmnet_output$lambda
+
+# Visualize LASSO lambda result
+coefs_lambdas <- 
+  coefficients(glmnet_output, s = lambdas )  %>% 
+  as.matrix() %>%  
+  t() %>% 
+  as.data.frame() %>% 
+  mutate(lambda = lambdas ) %>% 
+  select(lambda, everything(), -`(Intercept)`) %>% 
+  pivot_longer(cols = -lambda, 
+               names_to = "term", 
+               values_to = "coef") %>%
+  mutate(var = purrr::map_chr(stringr::str_split(term,"_"),~.[1]))
+
+coefs_lambdas %>%
+  ggplot(aes(x = lambda, y = coef, group = term, color = var)) +
+  geom_line() +
+  geom_vline(xintercept = best_se_penalty %>% pull(penalty), linetype = 'dashed') + 
+  theme_classic() + 
+  theme(legend.position = "bottom", legend.text=element_text(size=8))
+```
+
+```{r}
+# Create a boolean matrix (predictors x lambdas) of variable exclusion
+bool_predictor_exclude <- glmnet_output$beta==0
+
+# Loop over each variable
+var_imp <- sapply(seq_len(nrow(bool_predictor_exclude)), function(row) {
+    # Extract coefficient path (sorted from highest to lowest lambda)
+    this_coeff_path <- bool_predictor_exclude[row,]
+    # Compute and return the # of lambdas until this variable is out forever
+    ncol(bool_predictor_exclude) - which.min(this_coeff_path) + 1
+})
+
+# Create a dataset of this information and sort
+var_imp_data <- tibble(
+    var_name = rownames(bool_predictor_exclude),
+    var_imp = var_imp
+)
+var_imp_data %>% arrange(desc(var_imp))
+
+var_imp_data_delete_Nationality <- var_imp_data %>% filter(str_detect(var_name, "Reviewer_Nationality_")==FALSE)
+var_imp_data_delete_Nationality %>% arrange(desc(var_imp))
+```
+
+### GAMs
+
+```{r}
+# Remove month, year, nationality
+Hotel_Reviews <- Hotel_Reviews[, -which(names(Hotel_Reviews) == "month")]
+Hotel_Reviews <- Hotel_Reviews[, -which(names(Hotel_Reviews) == "Month")]
+Hotel_Reviews <- Hotel_Reviews[, -which(names(Hotel_Reviews) == "day")]
+Hotel_Reviews <- Hotel_Reviews[, -which(names(Hotel_Reviews) == "Reviewer_Nationality")]
+
+# Create new variables
+Hotel_Reviews$Review_Total_Positive_Word_Percentage <- Hotel_Reviews$Review_Total_Positive_Word_Counts / (Hotel_Reviews$Review_Total_Negative_Word_Counts + Hotel_Reviews$Review_Total_Positive_Word_Counts)
+
+Hotel_Reviews$Review_Total_Positive_Word_Percentage <- formatC(Hotel_Reviews$Review_Total_Positive_Word_Percentage, digits = 2, format = "f")
+
+Hotel_Reviews$Review_Total_Positive_Word_Percentage <- as.numeric(Hotel_Reviews$Review_Total_Positive_Word_Percentage)
+
+
+Hotel_Reviews$Review_Total_Negative_Word_Percentage <- Hotel_Reviews$Review_Total_Negative_Word_Counts / (Hotel_Reviews$Review_Total_Negative_Word_Counts + Hotel_Reviews$Review_Total_Positive_Word_Counts)
+
+Hotel_Reviews$Review_Total_Negative_Word_Percentage <- formatC(Hotel_Reviews$Review_Total_Positive_Word_Percentage, digits = 2, format = "f")
+
+Hotel_Reviews$Review_Total_Negative_Word_Percentage <- as.numeric(Hotel_Reviews$Review_Total_Negative_Word_Percentage)
+
+Hotel_Reviews <- Hotel_Reviews %>% filter(!Review_Total_Negative_Word_Percentage == "NaN")
+Hotel_Reviews <- Hotel_Reviews %>% filter(!Review_Total_Positive_Word_Percentage == "NaN")
+Hotel_Reviews <- Hotel_Reviews %>% na_if("") %>% na.omit
+```
+
+```{r}
+# Visualize non-linear before GAMs
+Hotel_Reviews %>%
+    ggplot(aes(x = Review_Total_Negative_Word_Counts, y = Reviewer_Average_Difference, color = Reviewer_continent)) + 
+    geom_point(alpha = 0.2) + 
+    geom_smooth(span = 0.2, se = FALSE) +
+    theme_classic()
+
+Hotel_Reviews %>%
+    ggplot(aes(x = Review_Total_Positive_Word_Counts, y = Reviewer_Average_Difference, color = Reviewer_continent)) + 
+    geom_point(alpha = 0.2) + 
+    geom_smooth(span = 0.2, se = FALSE) +
+    theme_classic()
+```
+
+##### GAMs with Counts
+```{r}
+# Generalized Additive Regression (GAM) Model
+gam_spec <- 
+  gen_additive_mod() %>%
+  set_engine(engine = 'mgcv') %>%
+  set_mode('regression') 
+
+fit_gam_model <- gam_spec %>% 
+  fit(Reviewer_Average_Difference ~ s(Review_Total_Negative_Word_Counts) + s(Review_Total_Positive_Word_Counts) + s(Average_Score) + Reviewer_continent + season, data = Hotel_Reviews)  
+
+# Summary: Parameter (linear) estimates and then Smooth Terms (H0: no relationship)
+fit_gam_model %>% pluck('fit') %>% summary() 
+
+# Diagnostics: Check to see if the number of knots is large enough (if p-value is low, increase number of knots)
+par(mfrow=c(2,2))
+fit_gam_model %>% pluck('fit') %>% mgcv::gam.check() 
+
+# Plot functions for each predictor
+# Visualize: Look at the estimated non-linear functions 
+# Dashed lines are +/- 2 SEs
+fit_gam_model %>% pluck('fit') %>% plot( pages = 1)
+```
+
+```{r}
+fit_gam_model_2 <- gam_spec %>% 
+  fit(Reviewer_Average_Difference ~ s(Review_Total_Negative_Word_Counts, k = 20) + s(Review_Total_Positive_Word_Counts, k = 20)+ Reviewer_continent + season + s(Average_Score, k = 20), data = Hotel_Reviews)  
+
+# Diagnostics: Check to see if the number of knots is large enough (if p-value is low, increase number of knots)
+par(mfrow=c(2,2))
+fit_gam_model_2 %>% pluck('fit') %>% mgcv::gam.check() 
+
+
+fit_gam_model_3 <- gam_spec %>% 
+  fit(Reviewer_Average_Difference ~ s(Review_Total_Negative_Word_Counts, k = 15) + s(Review_Total_Positive_Word_Counts, k = 15) + Reviewer_continent + season + s(Average_Score, k = 15), data = Hotel_Reviews)  
+
+# Diagnostics: Check to see if the number of knots is large enough (if p-value is low, increase number of knots)
+par(mfrow=c(2,2))
+fit_gam_model_3 %>% pluck('fit') %>% mgcv::gam.check() 
+
+# Our final GAM model with 20 breakpoints:
+fit_gam_model_final <- gam_spec %>% 
+  fit(Reviewer_Average_Difference ~ s(Review_Total_Negative_Word_Counts, k = 10) + s(Review_Total_Positive_Word_Counts, k = 10)+ Reviewer_continent + season + s(Average_Score, k = 10), data = Hotel_Reviews)  
+
+fit_gam_model_final %>% pluck('fit') %>% plot( pages = 1)
+
+```
+
+##### GAMs with Percentage
+```{r}
+# Generalized Additive Regression (GAM) Model
+gam_percentage_spec <- 
+  gen_additive_mod() %>%
+  set_engine(engine = 'mgcv') %>%
+  set_mode('regression') 
+
+fit_gam_percentage_model <- gam_percentage_spec %>% 
+  fit(Reviewer_Average_Difference ~ s(Review_Total_Negative_Word_Percentage) + s(Review_Total_Positive_Word_Percentage) + s(Average_Score) + Reviewer_continent + season, data = Hotel_Reviews)  
+
+# Summary: Parameter (linear) estimates and then Smooth Terms (H0: no relationship)
+fit_gam_percentage_model %>% pluck('fit') %>% summary() 
+
+# Diagnostics: Check to see if the number of knots is large enough (if p-value is low, increase number of knots)
+par(mfrow=c(2,2))
+fit_gam_percentage_model %>% pluck('fit') %>% mgcv::gam.check() 
+
+# Plot functions for each predictor
+# Visualize: Look at the estimated non-linear functions 
+# Dashed lines are +/- 2 SEs
+fit_gam_percentage_model %>% pluck('fit') %>% plot( pages = 1)
+```
+
+
+# Classification Model
+
+### Clean data for classification
+```{r}
+# Create binary variable for classification
+Hotel_Reviews$Reviewer_Average_Difference_Categorical <- ifelse(Hotel_Reviews$Reviewer_Average_Difference > 0, TRUE, FALSE) 
+
+Hotel_Reviews$Reviewer_Average_Difference_Categorical <- as.factor(Hotel_Reviews$Reviewer_Average_Difference_Categorical)
+
+Hotel_Reviews <- Hotel_Reviews %>% filter(!is.na(Reviewer_continent))
+
+# Remove all unnecessary variables + variables that create the Reviewer_Average_Difference_Categorical
+Hotel_Reviews <- Hotel_Reviews[, -which(names(Hotel_Reviews) == "Reviewer_Nationality")]
+Hotel_Reviews <- Hotel_Reviews[, -which(names(Hotel_Reviews) == "lat")]
+Hotel_Reviews <- Hotel_Reviews[, -which(names(Hotel_Reviews) == "lng")]
+Hotel_Reviews <- Hotel_Reviews[, -which(names(Hotel_Reviews) == "Reviewer_Average_Difference")]
+Hotel_Reviews <- Hotel_Reviews[, -which(names(Hotel_Reviews) == "Reviewer_Score")]
+Hotel_Reviews <- Hotel_Reviews[, -which(names(Hotel_Reviews) == "Average_Score")]
+```
+
+### One Single Tree
+```{r, cache = TRUE}
+data_fold <- vfold_cv(Hotel_Reviews, v = 10)
+
+ct_spec_tune <- decision_tree() %>%
+  set_engine(engine = 'rpart') %>%
+  set_args(cost_complexity = tune(),  
+           min_n = 2, 
+           tree_depth = NULL) %>% 
+  set_mode('classification') 
+
+data_rec <- recipe(Reviewer_Average_Difference_Categorical~ ., data = Hotel_Reviews)
+
+data_wf_tune <- workflow() %>%
+  add_model(ct_spec_tune) %>%
+  add_recipe(data_rec)
+
+param_grid <- grid_regular(cost_complexity(range = c(-5, 1)), levels = 10) 
+
+tune_res <- tune_grid(
+  data_wf_tune, 
+  resamples = data_fold, 
+  grid = param_grid, 
+  metrics = metric_set(accuracy) #change this for regression trees
+)
+
+autoplot(tune_res) + theme_classic()
+
+best_complexity <- select_by_one_std_err(tune_res, metric = 'accuracy', desc(cost_complexity))
+
+data_wf_final <- finalize_workflow(data_wf_tune, best_complexity)
+
+
+hotel_final_fit <- fit(data_wf_final, data = Hotel_Reviews)
+
+tune_res %>% 
+  collect_metrics() %>%
+  filter(cost_complexity == best_complexity %>% pull(cost_complexity))
+
+library("rpart.plot")
+hotel_final_fit %>% extract_fit_engine() %>% rpart.plot()
+
+
+tree_mod_highcp <- fit(
+    data_wf_tune %>%
+        update_model(ct_spec_tune %>% set_args(cost_complexity = .1)),
+    data = Hotel_Reviews
+)
+
+tree_mod_highcp %>% extract_fit_engine() %>% rpart.plot()
+
+# The best single tree ever!
+tree_mod_lowcp <- fit(
+    data_wf_tune %>%
+        update_model(ct_spec_tune %>% set_args(cost_complexity = .01)),
+    data = Hotel_Reviews
+)
+
+tree_mod_lowcp %>% extract_fit_engine() %>% rpart.plot()
+```
+
+
+### Random Forest
+```{r}
+# Recipe
+data_rec <- recipe(Reviewer_Average_Difference_Categorical ~ ., data = Hotel_Reviews) %>% 
+  step_nzv(all_predictors()) %>%
+  step_novel(all_nominal_predictors()) %>%
+  step_dummy(all_nominal_predictors()) 
+
+# Model Specification
+rf_spec <- rand_forest() %>%
+  set_engine(engine = 'ranger') %>% 
+  set_args(mtry = NULL, 
+           trees = 1000, 
+           min_n = 2,
+           probability = FALSE, # FALSE: get hard predictions (not needed for regression)
+           importance = 'impurity') %>% 
+  set_mode('classification')
+
+# Workflows
+data_wf_mtry <- workflow() %>%
+  add_model(rf_spec) %>%
+  add_recipe(data_rec)
+
+# Fit Models
+data_fit_mtry <- fit(data_wf_mtry, data = Hotel_Reviews)
+```
+
+```{r}
+# Evaluation
+# Custom Function to get OOB predictions, true observed outcomes and add a user-provided model label
+rf_OOB_output <- function(fit_model, model_label, truth){
+    tibble(
+          .pred_class = fit_model %>% extract_fit_engine() %>% pluck('predictions'), #OOB predictions
+          Reviewer_Average_Difference_Categorical = truth,
+          label = model_label
+      )
+}
+
+#check out the function output
+rf_OOB_output(data_fit_mtry, TRUE, Hotel_Reviews %>% pull(Reviewer_Average_Difference_Categorical))
+
+```
+
+```{r random forest}
+# Evaluate OOB Metrics
+data_rf_OOB_output <- bind_rows(
+    rf_OOB_output(data_fit_mtry, TRUE, Hotel_Reviews %>% pull(Reviewer_Average_Difference_Categorical))
+)
+
+data_rf_OOB_output %>% 
+    accuracy(truth = Reviewer_Average_Difference_Categorical, estimate = .pred_class)
+```
+
+```{r}
+# OOB prediction error 
+confusion <- rf_OOB_output(data_fit_mtry,TRUE, Hotel_Reviews %>% pull(Reviewer_Average_Difference_Categorical)) %>%
+    conf_mat(truth = Reviewer_Average_Difference_Categorical, estimate = .pred_class)
+
+# Variable importance measurement
+model_output <-data_fit_mtry %>% 
+    extract_fit_engine() 
+
+model_output %>% 
+    vip(num_features = 30) + theme_classic() #based on impurity
+
+model_output %>% vip::vi() %>% head()
+model_output %>% vip::vi() %>% tail()
+```
+
+```{r}
+ggplot(Hotel_Reviews, aes(x = Reviewer_Average_Difference_Categorical, y = Review_Total_Negative_Word_Counts)) +
+    geom_violin() + theme_classic()
+
+ggplot(Hotel_Reviews, aes(x = Reviewer_Average_Difference_Categorical, y = Review_Total_Positive_Word_Counts)) +
+    geom_violin() + theme_classic()
+
+```
+
+
+### LASSO for Logistic
+```{r, cache = TRUE}
+# Set reference level (to the outcome you are NOT interested in)
+Hotel_Reviews <- Hotel_Reviews%>%
+  mutate(Reviewer_Average_Difference_Categorical = relevel(factor(Reviewer_Average_Difference_Categorical), ref='FALSE')) 
+
+data_cv10 <- vfold_cv(Hotel_Reviews, v = 10)
+
+# Logistic LASSO Regression Model Spec
+logistic_lasso_spec_tune <- logistic_reg() %>%
+    set_engine('glmnet') %>%
+    set_args(mixture = 1, penalty = tune()) %>%
+    set_mode('classification')
+
+# Recipe
+logistic_rec <- recipe(Reviewer_Average_Difference_Categorical ~ ., data = Hotel_Reviews) %>%
+    step_normalize(all_numeric_predictors()) %>% 
+    step_dummy(all_nominal_predictors())
+
+# Workflow (Recipe + Model)
+log_lasso_wf <- workflow() %>% 
+    add_recipe(logistic_rec) %>%
+    add_model(logistic_lasso_spec_tune) 
+
+# Tune Model (trying a variety of values of Lambda penalty)
+penalty_grid <- grid_regular(
+  penalty(range = c(-5, 1)), #log10 transformed  (kept moving min down from 0)
+  levels = 100)
+
+tune_output <- tune_grid( 
+  log_lasso_wf, # workflow
+  resamples = data_cv10, # cv folds
+  metrics = metric_set(roc_auc,accuracy),
+  control = control_resamples(save_pred = TRUE, event_level = 'second'),
+  grid = penalty_grid # penalty grid defined above
+)
+
+# Visualize Model Evaluation Metrics from Tuning
+autoplot(tune_output) + theme_classic()
+```
+
+```{r}
+# Select Penalty
+best_se_penalty <- select_by_one_std_err(tune_output, metric = 'roc_auc', desc(penalty)) # choose penalty value based on the largest penalty within 1 se of the highest CV roc_auc
+best_se_penalty
+```
+
+```{r}
+# Fit Final Model
+final_fit_se <- finalize_workflow(log_lasso_wf, best_se_penalty) %>% # incorporates penalty value to workflow 
+    fit(data = Hotel_Reviews)
+
+final_fit_se %>% tidy() %>%
+  filter(estimate == 0)
+```
+
+```{r}
+glmnet_output <- final_fit_se %>% extract_fit_engine()
+    
+# Create a boolean matrix (predictors x lambdas) of variable exclusion
+bool_predictor_exclude <- glmnet_output$beta==0
+
+# Loop over each variable
+var_imp <- sapply(seq_len(nrow(bool_predictor_exclude)), function(row) {
+    # Extract coefficient path (sorted from highest to lowest lambda)
+    this_coeff_path <- bool_predictor_exclude[row,]
+    # Compute and return the # of lambdas until this variable is out forever
+    ncol(bool_predictor_exclude) - which.min(this_coeff_path) + 1
+})
+
+# Create a dataset of this information and sort
+var_imp_data <- tibble(
+    var_name = rownames(bool_predictor_exclude),
+    var_imp = var_imp
+)
+var_imp_data %>% arrange(desc(var_imp))
+```
+
+```{r}
+# CV results for "best lambda"
+tune_output %>%
+    collect_metrics() %>%
+    filter(penalty == best_se_penalty %>% pull(penalty))
+
+# Count up number of T/F in the training data
+Hotel_Reviews %>%
+    count(Reviewer_Average_Difference_Categorical) # Name of the outcome variable goes inside count()
+
+# Compute the NIR
+299575/(299575+211057)
+```
+
+```{r}
+# Soft Predictions on Training Data
+final_output <- final_fit_se %>% 
+  predict(new_data = Hotel_Reviews, type='prob') %>% 
+  bind_cols(Hotel_Reviews)
+
+final_output %>%
+  ggplot(aes(x = Reviewer_Average_Difference_Categorical, y = .pred_TRUE)) +
+  geom_boxplot()
+```
+
+```{r}
+# Use soft predictions
+final_output %>%
+    roc_curve(Reviewer_Average_Difference_Categorical,.pred_TRUE,event_level = 'second') %>%
+    autoplot()
+```
+
+```{r}
+# Thresholds in terms of reference level
+threshold_output <- final_output %>%
+    threshold_perf(truth = Reviewer_Average_Difference_Categorical, estimate = .pred_FALSE, thresholds = seq(0,1,by=.01)) 
+
+# J-index v. threshold for reviewer_Average_Difference_Categorical
+threshold_output %>%
+    filter(.metric == 'j_index') %>%
+    ggplot(aes(x = .threshold, y = .estimate)) +
+    geom_line() +
+    labs(y = 'J-index', x = 'threshold') +
+    theme_classic()
+
+threshold_output %>%
+    filter(.metric == 'distance') %>%
+    arrange(.estimate)
+
+log_metrics <- metric_set(accuracy,sens,yardstick::spec)
+
+#Accuracy + Specificity + Sensitivity 
+final_output %>%
+    mutate(.pred_class = make_two_class_pred(.pred_FALSE, levels(Reviewer_Average_Difference_Categorical
+), threshold =  0.40)) %>%
+    log_metrics(truth = Reviewer_Average_Difference_Categorical
+, estimate = .pred_class, event_level = 'second')
+```
+
+# Clustering Model
+
+### K-Means
+```{r}
+# Reload original cvs to bring back some variables
+Hotel_Reviews <- read_csv("data.csv")
+
+Hotel_Reviews <- Hotel_Reviews[, -which(names(Hotel_Reviews) == "Hotel_Name")]
+Hotel_Reviews <- Hotel_Reviews[, -which(names(Hotel_Reviews) == "Tags")]
+```
+
+```{r}
+# Select just 3 variables
+Hotel_Reviews_sub <- Hotel_Reviews %>%
+    select(Review_Total_Positive_Word_Counts, Reviewer_Score, Review_Total_Negative_Word_Counts)
+
+# Run k-means for k = centers = 3
+set.seed(253)
+kclust_k3 <- kmeans(Hotel_Reviews_sub, centers = 3)
+
+# Data-specific function to cluster and calculate total within-cluster SS
+hotel_cluster_ss <- function(k){
+    # Perform clustering
+    kclust3 <- kmeans(scale(Hotel_Reviews_sub), centers = 3)
+
+    # Return the total within-cluster sum of squares
+    return(kclust3$tot.withinss)
+}
+
+tibble(
+    k = 1:15,
+    tot_wc_ss = purrr::map_dbl(1:15, hotel_cluster_ss)
+) %>% 
+    ggplot(aes(x = k, y = tot_wc_ss)) +
+    geom_point() + 
+    labs(x = "Number of clusters",y = 'Total within-cluster sum of squares') + 
+    theme_classic()
+
+tot_wc_ss <- purrr::map_dbl(1:15, hotel_cluster_ss)
+
+# Add a variable (kclust_k3) to the original dataset 
+# containing the cluster assignments
+Hotel_Reviews <- Hotel_Reviews %>%
+    mutate(kclust_3 = factor(kclust_k3$cluster))
+
+# Visualize the cluster assignments on the original scatterplot
+ggplot(Hotel_Reviews, aes(x = Review_Total_Positive_Word_Counts, y = Review_Total_Negative_Word_Counts, color = kclust_3)) + geom_point() + theme_classic()
+
+# 3D plot
+fig_3D <- plot_ly(Hotel_Reviews, x=~Review_Total_Positive_Word_Counts, y=~Review_Total_Negative_Word_Counts, z=~Reviewer_Score, color =~kclust_3) %>%
+  add_markers(size=1) 
+
+fig_3D
+```

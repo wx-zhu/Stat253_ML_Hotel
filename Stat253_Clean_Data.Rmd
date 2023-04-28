@@ -1,0 +1,65 @@
+---
+title: "ProjectWork"
+author: "Jiaying Wu, Izzy Valdivia, Wenxuan Zhu"
+date: "9/30/2021"
+output: html_document
+---
+
+```{r hw2_setup, include=FALSE}
+knitr::opts_chunk$set(echo=TRUE, eval=TRUE)
+```
+
+
+```{r Read in Data}
+# library statements 
+# read in data
+library(dplyr)
+library(readr)
+library(broom)
+library(ggplot2)
+library(tidymodels) 
+library(stringr)
+library(tidyverse)
+library(gplots)
+library(lubridate)
+library(countrycode)
+library(gapminder)
+
+tidymodels_prefer() # Resolves conflicts, prefers tidymodel functions
+set.seed(189) 
+
+Hotel_Reviews <- read_csv("Hotel_Reviews.csv")
+
+```
+
+
+```{r Data Cleaning}
+Hotel_Reviews_Cleaned <- Hotel_Reviews %>% na_if("") %>% na.omit
+ 
+Hotel_Reviews_Cleaned <- Hotel_Reviews_Cleaned %>% mutate(Hotel_Country = word(Hotel_Address,-1))
+
+Hotel_Reviews_Cleaned$Hotel_Country[Hotel_Reviews_Cleaned$Hotel_Country == "Kingdom"] <- "United Kingdom"
+unique(Hotel_Reviews_Cleaned$Hotel_Country)
+head(Hotel_Reviews_Cleaned)
+
+Hotels_Subset_1000 <- Hotel_Reviews_Cleaned %>% subset(select = -c(days_since_review,Negative_Review, Positive_Review))
+dim(Hotels_Subset_1000)
+Hotels_Cleaned <-Hotels_Cleaned %>%
+   mutate(Reviewer_continent = countrycode(sourcevar = Hotels_Cleaned$Reviewer_Nationality,
+                             origin = "country.name",
+                             destination = "continent"))
+ 
+Hotels_Cleaned <-Hotels_Cleaned  %>%
+   separate(Review_Date, c("month", "day", "year"), sep = "/")
+ 
+Hotels_Cleaned <- Hotels_Cleaned %>% mutate(Month = month.name[as.numeric(month)])
+ 
+Hotels_Cleaned<-Hotels_Cleaned %>% 
+  mutate(season = ifelse(month %in% 10:12, "Fall",
+                                ifelse(month %in% 1:3, "Winter",
+                                       ifelse(month %in% 4:6, "Spring",
+                                              "Summer"))))
+# TODO: how to save?
+save(Hotels_Cleaned, file="CleanedHotelData.RData")
+```
+
